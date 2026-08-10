@@ -44,7 +44,7 @@ written = 0
 buffer  = []
 texts   = []
 
-pbar = tqdm(total=TRAIN_TOKENS + VAL_TOKENS, desc="[*] Gathering tokens", unit="tokens")
+pbar = tqdm(total=TRAIN_TOKENS, desc="[*] Gathering tokens", unit="tokens")
 
 def flush():
     global written
