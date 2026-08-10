@@ -45,4 +45,4 @@ tokenizer.train_from_iterator(
     show_progress=True
 )
 
-tokenizer.save_model(".", "droplet_synth_tokenizer")
+tokenizer.save_model(".", "tokenizer")
