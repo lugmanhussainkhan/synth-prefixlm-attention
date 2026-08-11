@@ -18,8 +18,8 @@ special_tokens=[
 ]
 
 tokenizer = ByteLevelBPETokenizer(
-    "./tokenizer/tokenizer-vocab.json",
-    "./tokenizer/tokenizer-merges.txt",
+    "../tokenizer/tokenizer-vocab.json",
+    "../tokenizer/tokenizer-merges.txt",
 )
 tokenizer.add_special_tokens(special_tokens)
 
