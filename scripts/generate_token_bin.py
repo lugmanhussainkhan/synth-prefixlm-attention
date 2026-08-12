@@ -10,8 +10,8 @@ TOKENIZER_DIR = PROJECT_ROOT / "tokenizer"
 OUTPUT_DIR = PROJECT_ROOT / "data"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-VOCAB_PATH = TOKENIZER_DIR / "tokenizer-vocab.json"
-MERGES_PATH = TOKENIZER_DIR / "tokenizer-merges.txt"
+VOCAB_PATH = TOKENIZER_DIR / "vocab.json"
+MERGES_PATH = TOKENIZER_DIR / "merges.txt"
 
 TOKEN_BIN = OUTPUT_DIR / "tokens.bin"
 DOCUMENT_LENGTHS_BIN = OUTPUT_DIR / "document_lengths.bin"
