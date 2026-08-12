@@ -11,7 +11,7 @@ dataset = load_dataset(
     filters=[
         ("language", "==", "en"),
         ("model", "==", "qwen-3-8b-memorization"),
-        ("words", "<=", 800),
+        ("words", "<", 800),
     ],
     columns=[
         "query",
@@ -28,8 +28,14 @@ def get_content(row):
 
 def get_training_corpus():
     it = iter(dataset)
-    for example in tqdm(range(50_000), desc="Feeding examples to tokenizer"):
-        yield get_content(next(it))
+    for _ in tqdm(range(50_000)):
+        row = next(it)
+        query = (row["query"] or "").strip()
+        answer = (row["synthetic_answer"] or "").strip()
+        if query:
+            yield query
+        if answer:
+            yield answer
 
 tokenizer.train_from_iterator(
     get_training_corpus(),
