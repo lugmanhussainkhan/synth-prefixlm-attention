@@ -3,7 +3,8 @@ from tokenizers import ByteLevelBPETokenizer
 from tqdm import tqdm
 from pathlib import Path
 
-output_dir = Path("../tokenizer")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+output_dir = PROJECT_ROOT / "tokenizer"
 output_dir.mkdir(parents=True, exist_ok=True)
 
 tokenizer = ByteLevelBPETokenizer()
