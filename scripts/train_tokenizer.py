@@ -51,4 +51,5 @@ tokenizer.train_from_iterator(
     show_progress=True
 )
 
-tokenizer.save_model(".", "tokenizer")
+tokenizer.save("../tokenizer/tokenizer-vocab.json")
+tokenizer.save_merges("../tokenizer/tokenizer-merges.txt")
