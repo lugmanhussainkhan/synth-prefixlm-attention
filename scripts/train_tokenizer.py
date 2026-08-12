@@ -1,6 +1,10 @@
 from datasets import load_dataset
 from tokenizers import ByteLevelBPETokenizer
 from tqdm import tqdm
+from pathlib import Path
+
+output_dir = Path("../tokenizer")
+output_dir.mkdir(parents=True, exist_ok=True)
 
 tokenizer = ByteLevelBPETokenizer()
 
@@ -51,5 +55,4 @@ tokenizer.train_from_iterator(
     show_progress=True
 )
 
-tokenizer.save("../tokenizer/tokenizer-vocab.json")
-tokenizer.save_merges("../tokenizer/tokenizer-merges.txt")
+tokenizer.save_model(str(output_dir))

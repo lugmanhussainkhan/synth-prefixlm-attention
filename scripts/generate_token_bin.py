@@ -2,10 +2,20 @@ from datasets import load_dataset
 from tokenizers import ByteLevelBPETokenizer
 from tqdm import tqdm
 import numpy as np
+from pathlib import Path
 
-TOKEN_BIN = "tokens.bin"
-DOCUMENT_LENGTHS_BIN = "document_lengths.bin"
-SEQUENCE_DOCUMENT_COUNTS_BIN = "sequence_document_counts.bin"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+TOKENIZER_DIR = PROJECT_ROOT / "tokenizer"
+OUTPUT_DIR = PROJECT_ROOT / "data"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+VOCAB_PATH = TOKENIZER_DIR / "tokenizer-vocab.json"
+MERGES_PATH = TOKENIZER_DIR / "tokenizer-merges.txt"
+
+TOKEN_BIN = OUTPUT_DIR / "tokens.bin"
+DOCUMENT_LENGTHS_BIN = OUTPUT_DIR / "document_lengths.bin"
+SEQUENCE_DOCUMENT_COUNTS_BIN = OUTPUT_DIR / "sequence_document_counts.bin"
 
 TRAIN_TOKENS = 5_000_000_000
 SEQ_LEN = 1024
@@ -21,8 +31,8 @@ special_tokens = [
 ]
 
 tokenizer = ByteLevelBPETokenizer(
-    "../tokenizer/tokenizer-vocab.json",
-    "../tokenizer/tokenizer-merges.txt",
+    str(VOCAB_PATH),
+    str(MERGES_PATH),
 )
 tokenizer.add_special_tokens(special_tokens)
 
