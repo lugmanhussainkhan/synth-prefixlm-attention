@@ -325,7 +325,16 @@ trainer = PrefixLMTrainer(
     args=training_args,
     train_dataset=dataset,
     data_collator=collate_fn,
+    # Without this, Trainer._save() skips the tokenizer branch and every
+    # checkpoint is pushed without tokenizer.json / tokenizer_config.json /
+    # special_tokens_map.json. On transformers < 4.46 use tokenizer=tokenizer.
+    processing_class=tokenizer,
 )
 
 print("[*] Starting training")
 trainer.train()
+
+print("[*] Saving final model and tokenizer")
+trainer.save_model(OUTPUT_DIR)
+tokenizer.save_pretrained(OUTPUT_DIR)
+trainer.push_to_hub(commit_message="End of training")
