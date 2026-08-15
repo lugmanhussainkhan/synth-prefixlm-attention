@@ -33,6 +33,12 @@ OUTPUT_DIR = "synth-prefixlm"
 RUN_NAME = "synth-prefixlm-1M-v1"
 HUB_MODEL_ID = "lugman/synth-prefixlm"
 
+# Set USE_FLEX=1 to use FlexAttention block masks instead of a dense boolean
+# mask. Block-sparse attention skips fully-masked 128x128 blocks entirely, so
+# with ~350-token documents packed into 1024-token sequences this is roughly a
+# 3x attention speedup on top of removing the host-side mask build.
+USE_FLEX = os.environ.get("USE_FLEX", "0") == "1"
+
 special_tokens = [
     "<|pad|>",
     "<|unk|>",
@@ -109,8 +115,10 @@ class MemmapDataset(Dataset):
         arr = np.asarray(self.tokens[start:start + self.seq_len], dtype=np.int64)
         ids = torch.from_numpy(arr)
         labels = torch.full_like(ids, -100)
-        position_ids = torch.zeros_like(ids)
-        document_ids = torch.full_like(ids, -1)
+        position_ids = torch.zeros(self.seq_len, dtype=torch.long)
+        # int16 rather than int64: this is transferred to the GPU every step and
+        # only needs to hold a per-sequence document index.
+        document_ids = torch.full((self.seq_len,), -1, dtype=torch.int16)
         prefix_tokens = torch.zeros(self.seq_len, dtype=torch.bool)
 
         first_document = self.document_offsets[idx]
@@ -146,37 +154,81 @@ class MemmapDataset(Dataset):
 
 
 def collate_fn(batch):
-    input_ids = torch.stack([b["input_ids"] for b in batch])
-    labels = torch.stack([b["labels"] for b in batch])
-    position_ids = torch.stack([b["position_ids"] for b in batch])
-    document_ids = torch.stack([b["document_ids"] for b in batch])
-    prefix_tokens = torch.stack([b["prefix_tokens"] for b in batch])
-    seq_len = input_ids.shape[1]
+    # No mask construction here. The [B, 1, L, L] boolean mask is 268 MB per
+    # batch at B=256/L=1024; building it on CPU and pinning + transferring it
+    # every step was the single largest cost in the original script. We ship
+    # [B, L] metadata (512 KB) instead and expand on device.
+    return {
+        key: torch.stack([sample[key] for sample in batch])
+        for key in ("input_ids", "labels", "position_ids", "document_ids", "prefix_tokens")
+    }
+
+
+_STATIC_MASKS = {}
+
+
+def _static_masks(seq_len, device):
+    key = (seq_len, device)
+    if key not in _STATIC_MASKS:
+        causal = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device).tril()
+        eye = torch.eye(seq_len, dtype=torch.bool, device=device)
+        _STATIC_MASKS[key] = (causal, eye)
+    return _STATIC_MASKS[key]
+
+
+def build_attention_mask(document_ids, prefix_tokens):
+    """Dense boolean prefix-LM mask, built on device. True == attend."""
+    seq_len = document_ids.shape[1]
+    causal, eye = _static_masks(seq_len, document_ids.device)
 
     valid_tokens = document_ids.ge(0)
     same_document = document_ids[:, :, None].eq(document_ids[:, None, :])
-    causal = torch.ones(seq_len, seq_len, dtype=torch.bool).tril()
     prefix_attention = prefix_tokens[:, :, None] & prefix_tokens[:, None, :]
 
     # Prefix tokens see the full prefix in their own document. Answer tokens
     # use the causal branch, and same_document makes the mask block diagonal.
-    attention_mask = (
-        same_document
-        & valid_tokens[:, :, None]
-        & valid_tokens[:, None, :]
-        & (causal | prefix_attention)
-    )
+    attention_mask = same_document
+    attention_mask &= valid_tokens[:, :, None]
+    attention_mask &= valid_tokens[:, None, :]
+    attention_mask &= causal | prefix_attention
 
-    padding_tokens = document_ids.eq(-1)
-    padding_diagonal = padding_tokens[:, :, None] & torch.eye(seq_len, dtype=torch.bool)
-    attention_mask |= padding_diagonal
+    # Padding rows attend to themselves so softmax never sees an all-masked row.
+    attention_mask |= (~valid_tokens)[:, :, None] & eye
+    return attention_mask[:, None, :, :]
 
-    return {
-        "input_ids": input_ids,
-        "labels": labels,
-        "position_ids": position_ids,
-        "attention_mask": attention_mask[:, None, :, :],
-    }
+
+if USE_FLEX:
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    _compiled_create_block_mask = torch.compile(create_block_mask, dynamic=False)
+
+    def build_attention_mask(document_ids, prefix_tokens):  # noqa: F811
+        batch_size, seq_len = document_ids.shape
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            valid = document_ids[b, q_idx] >= 0
+            same_document = document_ids[b, q_idx] == document_ids[b, kv_idx]
+            causal = q_idx >= kv_idx
+            prefix = prefix_tokens[b, q_idx] & prefix_tokens[b, kv_idx]
+            return torch.where(
+                valid,
+                same_document & (causal | prefix),
+                q_idx == kv_idx,
+            )
+
+        return _compiled_create_block_mask(
+            mask_mod, batch_size, None, seq_len, seq_len,
+            device=document_ids.device,
+        )
+
+
+class PrefixLMTrainer(Trainer):
+    def _prepare_inputs(self, inputs):
+        inputs = super()._prepare_inputs(inputs)
+        document_ids = inputs.pop("document_ids")
+        prefix_tokens = inputs.pop("prefix_tokens")
+        inputs["attention_mask"] = build_attention_mask(document_ids, prefix_tokens)
+        return inputs
 
 
 print("[*] Loading packed, memmap-backed dataset")
@@ -195,7 +247,12 @@ config = LlamaConfig(
     intermediate_size=312,
     num_hidden_layers=6,
     num_attention_heads=4,
-    head_dim=36,
+    # head_dim MUST be a multiple of 8 or SDPA silently falls back to the math
+    # backend, which materializes the full [B, H, L, L] fp32 score matrix and
+    # keeps it for backward (~4.3 GB per layer at B=256, L=1024). Llama allows
+    # head_dim != hidden_size // num_attention_heads, so 32 keeps hidden_size
+    # at 144 and only costs ~10k parameters.
+    head_dim=32,
     num_key_value_heads=2,
     max_position_embeddings=1024,
     rope_theta=10000.0,
@@ -207,10 +264,17 @@ config = LlamaConfig(
     pad_token_id=tokenizer.pad_token_id,
     bos_token_id=tokenizer.bos_token_id,
     eos_token_id=tokenizer.eos_token_id,
-    attn_implementation="sdpa",
+    attn_implementation="flex_attention" if USE_FLEX else "sdpa",
 )
 model = LlamaForCausalLM(config)
 print(f"[*] Model parameters: {model.num_parameters():,}")
+print(f"[*] Attention implementation: {model.config._attn_implementation}")
+
+# ~19,000 optimizer steps at 262k tokens/step. WSD: 2% warmup, flat, 20% decay.
+total_steps = len(dataset) // 256
+warmup_steps = max(1, int(0.02 * total_steps))
+decay_steps = int(0.20 * total_steps)
+stable_steps = total_steps - warmup_steps - decay_steps
 
 print("[*] Defining training arguments")
 training_args = TrainingArguments(
@@ -219,6 +283,13 @@ training_args = TrainingArguments(
     per_device_train_batch_size=256,
     gradient_accumulation_steps=1,
     learning_rate=6e-4,
+    lr_scheduler_type="warmup_stable_decay",
+    lr_scheduler_kwargs={
+        "num_stable_steps": stable_steps,
+        "num_decay_steps": decay_steps,
+        "min_lr_ratio": 0.0,
+    },
+    warmup_steps=warmup_steps,
     weight_decay=0.1,
     adam_beta1=0.9,
     adam_beta2=0.95,
@@ -227,13 +298,14 @@ training_args = TrainingArguments(
     bf16=True,
     fp16=False,
     tf32=True,
-    torch_compile=os.environ.get("TORCH_COMPILE", "0") == "1",
+    torch_compile=os.environ.get("TORCH_COMPILE", "1") == "1",
     logging_steps=50,
     logging_first_step=True,
     eval_strategy="no",
-    dataloader_num_workers=2,
+    dataloader_num_workers=6,
     dataloader_pin_memory=True,
     dataloader_persistent_workers=True,
+    dataloader_prefetch_factor=4,
     dataloader_drop_last=True,
     gradient_checkpointing=False,
     seed=42,
@@ -248,7 +320,7 @@ training_args = TrainingArguments(
     hub_strategy="all_checkpoints",
 )
 
-trainer = Trainer(
+trainer = PrefixLMTrainer(
     model=model,
     args=training_args,
     train_dataset=dataset,
