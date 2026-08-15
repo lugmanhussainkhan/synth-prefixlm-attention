@@ -29,9 +29,9 @@ DOCUMENT_LENGTHS_BIN = DATA_DIR / "document_lengths.bin"
 SEQUENCE_DOCUMENT_COUNTS_BIN = DATA_DIR / "sequence_document_counts.bin"
 SEQ_LEN = 1024
 
-OUTPUT_DIR = "synth-prefixlm"
-RUN_NAME = "synth-prefixlm-1M-v1"
-HUB_MODEL_ID = "lugman/synth-prefixlm"
+OUTPUT_DIR = "synth-prefixlm-5M-v1"
+RUN_NAME = "synth-prefixlm-5M-v1"
+HUB_MODEL_ID = "lugman/synth-prefixlm-5M-v1"
 
 # Set USE_FLEX=1 to use FlexAttention block masks instead of a dense boolean
 # mask. Block-sparse attention skips fully-masked 128x128 blocks entirely, so
@@ -243,10 +243,10 @@ print(f"[*] Dataset ready: {len(dataset):,} packed sequences of {SEQ_LEN} tokens
 print("[*] Setting up model")
 config = LlamaConfig(
     vocab_size=len(tokenizer),
-    hidden_size=144,
-    intermediate_size=312,
-    num_hidden_layers=6,
-    num_attention_heads=4,
+    hidden_size=256,
+    intermediate_size=688,
+    num_hidden_layers=7,
+    num_attention_heads=8,
     # head_dim MUST be a multiple of 8 or SDPA silently falls back to the math
     # backend, which materializes the full [B, H, L, L] fp32 score matrix and
     # keeps it for backward (~4.3 GB per layer at B=256, L=1024). Llama allows
