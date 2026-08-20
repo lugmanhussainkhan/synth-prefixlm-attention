@@ -16,10 +16,15 @@ TOKENIZER_DOCUMENTS_PER_DATASET = 10_000
 
 def get_training_corpus():
     for name in DATASET_NAMES:
-        documents = islice(iter_dataset(name), TOKENIZER_DOCUMENTS_PER_DATASET)
+        # Bin generation applies FLAN's 1,500-document per-task cap. Applying
+        # that cap here can exhaust every task in a large subset before this
+        # global 10,000-document sample is full, leaving the iterator scanning
+        # millions of rows without yielding anything.
+        documents = iter_dataset(name, flan_documents_per_type=None)
+        documents = islice(documents, TOKENIZER_DOCUMENTS_PER_DATASET)
         for query, answer in tqdm(
             documents,
-            total=TOKENIZER_DOCUMENTS_PER_DATASET,
+            total=None if name == "no_robots" else TOKENIZER_DOCUMENTS_PER_DATASET,
             desc=f"[*] Reading {name}",
         ):
             yield query

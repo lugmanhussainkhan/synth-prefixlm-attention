@@ -307,7 +307,7 @@ def iter_flan(max_per_type=FLAN_DOCUMENTS_PER_TYPE):
 
         for row in dataset:
             task = row["_task_name"]
-            if counts[task] >= max_per_type:
+            if max_per_type is not None and counts[task] >= max_per_type:
                 continue
 
             pair = clean_pair(row["inputs"], row["targets"])
@@ -362,13 +362,17 @@ def iter_textbook():
                 yield pair
 
 
-def iter_dataset(name, synth_documents=SYNTH_DOCUMENTS):
+def iter_dataset(
+    name,
+    synth_documents=SYNTH_DOCUMENTS,
+    flan_documents_per_type=FLAN_DOCUMENTS_PER_TYPE,
+):
     if name == "no_robots":
         return iter_no_robots()
     if name == "tasksource":
         return iter_tasksource()
     if name == "flan":
-        return iter_flan()
+        return iter_flan(max_per_type=flan_documents_per_type)
     if name == "synth":
         return iter_synth(max_documents=synth_documents)
     if name == "textbook":
