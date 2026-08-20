@@ -19,13 +19,27 @@ SYNTH_DOCUMENTS = 4_000_000
 SHUFFLE_BUFFER_SIZE = 10_000
 SEED = 42
 
-# The default remote Parquet range is 32 MiB. These datasets are read
-# sequentially from large shards, so one larger prefetched range reduces HTTP
-# request latency without materializing the dataset locally.
+# Rows are read in column-wise batches instead of one Python dict per row.
+# Arrow hands back plain lists of strings, which is what encode_batch wants.
+READ_BATCH_SIZE = 1_000
+
+# A subset is abandoned once this many rows in a row have been scanned without
+# a single document surviving the per-task cap. Without it the FLAN iterators
+# stream every remaining row of a multi-hundred-GB shard set only to discard
+# it, which is what made bin generation effectively unbounded.
+FLAN_PATIENCE_ROWS = 250_000
+
+# Optional hard ceiling per FLAN subset. None keeps the per-task cap as the
+# only limit; set an integer to bound a subset's contribution outright.
+FLAN_DOCUMENTS_PER_SUBSET = None
+
+# The default remote Parquet range is 32 MiB. Smaller coalesced ranges with a
+# deeper prefetch queue overlap the next HTTP fetch with the current decode,
+# instead of alternating between one big blocking download and an idle socket.
 PARQUET_SCAN_OPTIONS = ds.ParquetFragmentScanOptions(
     cache_options=pa.CacheOptions(
-        prefetch_limit=1,
-        range_size_limit=128 << 20,
+        prefetch_limit=4,
+        range_size_limit=64 << 20,
     ),
 )
 
@@ -255,128 +269,258 @@ def clean_pair(query, answer):
     return None
 
 
+def _stream(repo, *, shard=None, num_shards=None, shuffle=True, **kwargs):
+    dataset = load_dataset(
+        repo,
+        split="train",
+        streaming=True,
+        fragment_scan_options=PARQUET_SCAN_OPTIONS,
+        **kwargs,
+    )
+    # Shard before shuffling so each worker owns a disjoint slice of the
+    # underlying parquet files and no byte is downloaded twice.
+    if num_shards and num_shards > 1:
+        dataset = dataset.shard(num_shards=num_shards, index=shard)
+    if shuffle:
+        dataset = dataset.shuffle(seed=SEED + (shard or 0), buffer_size=SHUFFLE_BUFFER_SIZE)
+    return dataset
+
+
+# --------------------------------------------------------------------------
+# Work units
+#
+# A unit is a self-contained, independently streamable slice of one source.
+# Caps are resolved per unit so workers never have to coordinate.
+# --------------------------------------------------------------------------
+
+
+def build_work_units(synth_shards=8, tasksource_shards=1, textbook_shards=1):
+    units = [("no_robots", None, None, None)]
+
+    for index in range(tasksource_shards):
+        units.append(("tasksource", None, index, tasksource_shards))
+
+    for subset in FLAN_SUBSETS:
+        units.append(("flan", subset, None, None))
+
+    for index in range(synth_shards):
+        units.append(("synth", None, index, synth_shards))
+
+    for index in range(textbook_shards):
+        units.append(("textbook", None, index, textbook_shards))
+
+    return units
+
+
+def iter_unit(unit):
+    """Yield (queries, answers) batches for one work unit."""
+    source, subset, shard, num_shards = unit
+    if source == "no_robots":
+        return iter_no_robots()
+    if source == "tasksource":
+        return iter_tasksource(shard=shard, num_shards=num_shards)
+    if source == "flan":
+        return iter_flan_subset(subset)
+    if source == "synth":
+        return iter_synth(shard=shard, num_shards=num_shards)
+    if source == "textbook":
+        return iter_textbook(shard=shard, num_shards=num_shards)
+    raise ValueError(f"Unknown dataset: {source}")
+
+
+def _batched(pairs, batch_size=READ_BATCH_SIZE):
+    queries = []
+    answers = []
+    for query, answer in pairs:
+        queries.append(query)
+        answers.append(answer)
+        if len(queries) >= batch_size:
+            yield queries, answers
+            queries = []
+            answers = []
+    if queries:
+        yield queries, answers
+
+
+# --------------------------------------------------------------------------
+# Per-source iterators (each yields (queries, answers) batches)
+# --------------------------------------------------------------------------
+
+
 def iter_no_robots():
     dataset = load_dataset("HuggingFaceH4/no_robots")
 
-    for split in dataset.values():
-        for row in split:
-            if (row["category"] or "").casefold() in {"chat", "coding"}:
-                continue
+    def pairs():
+        for split in dataset.values():
+            for row in split:
+                if (row["category"] or "").casefold() in {"chat", "coding"}:
+                    continue
 
-            messages = row["messages"]
-            if len(messages) < 2:
-                continue
+                messages = row["messages"]
+                if len(messages) < 2:
+                    continue
 
-            system_prompt = ""
-            start = 0
-            if messages[0]["role"] == "system":
-                system_prompt = (messages[0]["content"] or "").strip()
-                start = 1
+                system_prompt = ""
+                start = 0
+                if messages[0]["role"] == "system":
+                    system_prompt = (messages[0]["content"] or "").strip()
+                    start = 1
 
-            if len(messages) <= start + 1:
-                continue
-            if messages[start]["role"] != "user" or messages[start + 1]["role"] != "assistant":
-                continue
+                if len(messages) <= start + 1:
+                    continue
+                if messages[start]["role"] != "user" or messages[start + 1]["role"] != "assistant":
+                    continue
 
-            query = messages[start]["content"]
-            if system_prompt:
-                query = f"{system_prompt}\n\n{query}"
-            pair = clean_pair(query, messages[start + 1]["content"])
-            if pair:
-                yield pair
+                query = messages[start]["content"]
+                if system_prompt:
+                    query = f"{system_prompt}\n\n{query}"
+                pair = clean_pair(query, messages[start + 1]["content"])
+                if pair:
+                    yield pair
+
+    return _batched(pairs())
 
 
-def iter_tasksource(max_per_type=TASKSOURCE_DOCUMENTS_PER_TYPE):
-    counts = Counter()
-    dataset = load_dataset(
+def iter_tasksource(max_per_type=TASKSOURCE_DOCUMENTS_PER_TYPE, shard=None, num_shards=None):
+    dataset = _stream(
         "tasksource/tasksource-instruct-v0",
-        split="train",
-        streaming=True,
+        shard=shard,
+        num_shards=num_shards,
         filters=[("task", "in", sorted(TASKSOURCE_TASKS))],
         columns=["inputs", "targets", "task"],
-        fragment_scan_options=PARQUET_SCAN_OPTIONS,
-    ).shuffle(seed=SEED, buffer_size=SHUFFLE_BUFFER_SIZE)
+    )
 
-    for row in dataset:
-        task = row["task"]
-        if task not in TASKSOURCE_TASKS or counts[task] >= max_per_type:
-            continue
+    def pairs():
+        counts = Counter()
+        saturated = set()
+        for batch in dataset.iter(batch_size=READ_BATCH_SIZE):
+            for task, inputs, targets in zip(batch["task"], batch["inputs"], batch["targets"]):
+                if task not in TASKSOURCE_TASKS or counts[task] >= max_per_type:
+                    continue
 
-        pair = clean_pair(row["inputs"], (row["targets"] or "").strip().removesuffix("."))
-        if pair:
-            counts[task] += 1
-            yield pair
+                pair = clean_pair(inputs, (targets or "").strip().removesuffix("."))
+                if pair:
+                    counts[task] += 1
+                    if counts[task] >= max_per_type:
+                        saturated.add(task)
+                    yield pair
+            # The whitelist is known up front, so this exit is exact: once
+            # every task is capped there is nothing left to find.
+            if len(saturated) >= len(TASKSOURCE_TASKS):
+                return
+
+    return _batched(pairs())
+
+
+def iter_flan_subset(
+    subset,
+    max_per_type=FLAN_DOCUMENTS_PER_TYPE,
+    max_documents=FLAN_DOCUMENTS_PER_SUBSET,
+    patience_rows=FLAN_PATIENCE_ROWS,
+):
+    dataset = _stream(
+        "Open-Orca/FLAN",
+        data_dir=subset,
+        columns=["inputs", "targets", "_task_name"],
+    )
+
+    def pairs():
+        counts = Counter()
+        produced = 0
+        idle_rows = 0
+        for batch in dataset.iter(batch_size=READ_BATCH_SIZE):
+            batch_produced = 0
+            for task, inputs, targets in zip(batch["_task_name"], batch["inputs"], batch["targets"]):
+                if max_per_type is not None and counts[task] >= max_per_type:
+                    continue
+
+                pair = clean_pair(inputs, targets)
+                if pair:
+                    counts[task] += 1
+                    produced += 1
+                    batch_produced += 1
+                    yield pair
+
+            if max_documents is not None and produced >= max_documents:
+                return
+
+            # The original code kept streaming (and paying for) every
+            # remaining row of the subset once all tasks were capped.
+            if batch_produced:
+                idle_rows = 0
+            else:
+                idle_rows += len(batch["_task_name"])
+                if patience_rows is not None and idle_rows >= patience_rows:
+                    return
+
+    return _batched(pairs())
 
 
 def iter_flan(max_per_type=FLAN_DOCUMENTS_PER_TYPE):
+    """Sequential fallback kept for train_tokenizer.py."""
     for subset in FLAN_SUBSETS:
-        counts = Counter()
-        dataset = load_dataset(
-            "Open-Orca/FLAN",
-            data_dir=subset,
-            split="train",
-            streaming=True,
-            columns=["inputs", "targets", "_task_name"],
-            fragment_scan_options=PARQUET_SCAN_OPTIONS,
-        ).shuffle(seed=SEED, buffer_size=SHUFFLE_BUFFER_SIZE)
-
-        for row in dataset:
-            task = row["_task_name"]
-            if max_per_type is not None and counts[task] >= max_per_type:
-                continue
-
-            pair = clean_pair(row["inputs"], row["targets"])
-            if pair:
-                counts[task] += 1
-                yield pair
+        for queries, answers in iter_flan_subset(subset, max_per_type=max_per_type):
+            yield from zip(queries, answers)
 
 
-def iter_synth(max_documents=SYNTH_DOCUMENTS):
-    dataset = load_dataset(
+def iter_synth(max_documents=SYNTH_DOCUMENTS, shard=None, num_shards=None):
+    dataset = _stream(
         "PleIAs/SYNTH",
-        split="train",
-        streaming=True,
+        shard=shard,
+        num_shards=num_shards,
         filters=[
             ("language", "==", "en"),
             ("model", "==", "qwen-3-8b-memorization"),
             ("words", "<", 800),
         ],
         columns=["query", "synthetic_answer"],
-        fragment_scan_options=PARQUET_SCAN_OPTIONS,
-    ).shuffle(seed=SEED, buffer_size=SHUFFLE_BUFFER_SIZE)
+    )
 
-    documents = 0
-    for row in dataset:
-        pair = clean_pair(row["query"], row["synthetic_answer"])
-        if pair:
-            yield pair
-            documents += 1
-            if max_documents is not None and documents >= max_documents:
-                break
+    shard_budget = max_documents
+    if shard_budget is not None and num_shards and num_shards > 1:
+        shard_budget = -(-shard_budget // num_shards)
+
+    def pairs():
+        documents = 0
+        for batch in dataset.iter(batch_size=READ_BATCH_SIZE):
+            for query, answer in zip(batch["query"], batch["synthetic_answer"]):
+                pair = clean_pair(query, answer)
+                if pair:
+                    yield pair
+                    documents += 1
+                    if shard_budget is not None and documents >= shard_budget:
+                        return
+
+    return _batched(pairs())
 
 
-def iter_textbook():
-    dataset = load_dataset(
+def iter_textbook(shard=None, num_shards=None):
+    dataset = _stream(
         "MegaScience/TextbookReasoning",
-        split="train",
-        streaming=True,
+        shard=shard,
+        num_shards=num_shards,
         columns=["question", "answer", "subject", "reference_answer"],
-        fragment_scan_options=PARQUET_SCAN_OPTIONS,
-    ).shuffle(seed=SEED, buffer_size=SHUFFLE_BUFFER_SIZE)
+    )
 
-    for row in dataset:
-        if (row["subject"] or "").casefold() not in {"biology", "medicine"}:
-            continue
+    def pairs():
+        for batch in dataset.iter(batch_size=READ_BATCH_SIZE):
+            for subject, question, answer, reference in zip(
+                batch["subject"], batch["question"], batch["answer"], batch["reference_answer"]
+            ):
+                if (subject or "").casefold() not in {"biology", "medicine"}:
+                    continue
 
-        pair = clean_pair(row["question"], row["answer"])
-        if pair:
-            yield pair
+                pair = clean_pair(question, answer)
+                if pair:
+                    yield pair
 
-        lower_question = (row["question"] or "").lower()
-        if "prove" not in lower_question and "show that" not in lower_question:
-            pair = clean_pair(row["question"], row["reference_answer"])
-            if pair:
-                yield pair
+                lower_question = (question or "").lower()
+                if "prove" not in lower_question and "show that" not in lower_question:
+                    pair = clean_pair(question, reference)
+                    if pair:
+                        yield pair
+
+    return _batched(pairs())
 
 
 def iter_dataset(
@@ -384,17 +528,25 @@ def iter_dataset(
     synth_documents=SYNTH_DOCUMENTS,
     flan_documents_per_type=FLAN_DOCUMENTS_PER_TYPE,
 ):
+    """Row-at-a-time compatibility wrapper (used by train_tokenizer.py)."""
     if name == "no_robots":
-        return iter_no_robots()
-    if name == "tasksource":
-        return iter_tasksource()
-    if name == "flan":
+        batches = iter_no_robots()
+    elif name == "tasksource":
+        batches = iter_tasksource()
+    elif name == "flan":
         return iter_flan(max_per_type=flan_documents_per_type)
-    if name == "synth":
-        return iter_synth(max_documents=synth_documents)
-    if name == "textbook":
-        return iter_textbook()
-    raise ValueError(f"Unknown dataset: {name}")
+    elif name == "synth":
+        batches = iter_synth(max_documents=synth_documents)
+    elif name == "textbook":
+        batches = iter_textbook()
+    else:
+        raise ValueError(f"Unknown dataset: {name}")
+
+    def rows():
+        for queries, answers in batches:
+            yield from zip(queries, answers)
+
+    return rows()
 
 
 def iter_mixture():
