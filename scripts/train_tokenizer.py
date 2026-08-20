@@ -1,46 +1,30 @@
-from datasets import load_dataset
+from itertools import islice
+from pathlib import Path
+
 from tokenizers import ByteLevelBPETokenizer
 from tqdm import tqdm
-from pathlib import Path
+
+from dataset_mixture import DATASET_NAMES, iter_dataset
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 output_dir = PROJECT_ROOT / "tokenizer"
 output_dir.mkdir(parents=True, exist_ok=True)
 
 tokenizer = ByteLevelBPETokenizer()
+TOKENIZER_DOCUMENTS_PER_DATASET = 10_000
 
-dataset = load_dataset(
-    "PleIAs/SYNTH",
-    split="train",
-    streaming=True,
-    filters=[
-        ("language", "==", "en"),
-        ("model", "==", "qwen-3-8b-memorization"),
-        ("words", "<", 800),
-    ],
-    columns=[
-        "query",
-        "synthetic_answer",
-    ],
-)
-
-def get_content(row):
-    parts = [
-        row["query"],
-        row["synthetic_answer"]
-    ]
-    return "\n".join(part.strip() for part in parts if part and part.strip())
 
 def get_training_corpus():
-    it = iter(dataset)
-    for _ in tqdm(range(50_000)):
-        row = next(it)
-        query = (row["query"] or "").strip()
-        answer = (row["synthetic_answer"] or "").strip()
-        if query:
+    for name in DATASET_NAMES:
+        documents = islice(iter_dataset(name), TOKENIZER_DOCUMENTS_PER_DATASET)
+        for query, answer in tqdm(
+            documents,
+            total=TOKENIZER_DOCUMENTS_PER_DATASET,
+            desc=f"[*] Reading {name}",
+        ):
             yield query
-        if answer:
             yield answer
+
 
 tokenizer.train_from_iterator(
     get_training_corpus(),
@@ -53,7 +37,7 @@ tokenizer.train_from_iterator(
         "<|eos|>",
         "<|sep|>",
     ],
-    show_progress=True
+    show_progress=True,
 )
 
 tokenizer.save_model(str(output_dir))

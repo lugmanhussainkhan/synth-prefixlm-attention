@@ -1,8 +1,11 @@
-from datasets import load_dataset
+from collections import Counter
+from pathlib import Path
+
+import numpy as np
 from tokenizers import ByteLevelBPETokenizer
 from tqdm import tqdm
-import numpy as np
-from pathlib import Path
+
+from dataset_mixture import DATASET_NAMES, SYNTH_DOCUMENTS, iter_dataset
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -17,7 +20,7 @@ TOKEN_BIN = OUTPUT_DIR / "tokens.bin"
 DOCUMENT_LENGTHS_BIN = OUTPUT_DIR / "document_lengths.bin"
 SEQUENCE_DOCUMENT_COUNTS_BIN = OUTPUT_DIR / "sequence_document_counts.bin"
 
-TRAIN_TOKENS = 5_000_000_000
+MAX_TOKENS = None
 SEQ_LEN = 1024
 BATCH_TEXTS = 1000
 PACKING_POOL_SIZE = 10_000
@@ -36,21 +39,6 @@ tokenizer = ByteLevelBPETokenizer(
 )
 tokenizer.add_special_tokens(special_tokens)
 
-dataset = load_dataset(
-    "PleIAs/SYNTH",
-    split="train",
-    streaming=True,
-    filters=[
-        ("language", "==", "en"),
-        ("model", "==", "qwen-3-8b-memorization"),
-        ("words", "<", 800),
-    ],
-    columns=[
-        "query",
-        "synthetic_answer",
-    ],
-)
-
 pad_id = tokenizer.token_to_id("<|pad|>")
 bos_id = tokenizer.token_to_id("<|bos|>")
 eos_id = tokenizer.token_to_id("<|eos|>")
@@ -61,11 +49,11 @@ packing_pool = []
 document_tokens = 0
 documents_written = 0
 sequences_written = 0
-empty_documents = 0
 oversized_documents = 0
 reached_token_limit = False
+documents_by_source = Counter()
 
-pbar = tqdm(total=TRAIN_TOKENS, desc="[*] Gathering document tokens", unit="tokens")
+pbar = tqdm(total=MAX_TOKENS, desc="[*] Gathering document tokens", unit="tokens")
 
 
 def write_packing_pool():
@@ -131,13 +119,17 @@ def tokenize_texts():
     if not texts:
         return
 
-    queries = [query for query, _ in texts]
-    answers = [answer for _, answer in texts]
+    sources = [source for source, _, _ in texts]
+    queries = [query for _, query, _ in texts]
+    answers = [answer for _, _, answer in texts]
     encoded_queries = tokenizer.encode_batch(queries, add_special_tokens=False)
     encoded_answers = tokenizer.encode_batch(answers, add_special_tokens=False)
     texts.clear()
 
-    for encoded_query, encoded_answer in zip(encoded_queries, encoded_answers):
+    for source, encoded_query, encoded_answer in zip(sources, encoded_queries, encoded_answers):
+        if source == "synth" and documents_by_source[source] >= SYNTH_DOCUMENTS:
+            continue
+
         query_ids = encoded_query.ids
         answer_ids = encoded_answer.ids
         query_length = len(query_ids)
@@ -148,7 +140,7 @@ def tokenize_texts():
             oversized_documents += 1
             continue
 
-        if document_tokens + total_length > TRAIN_TOKENS:
+        if MAX_TOKENS is not None and document_tokens + total_length > MAX_TOKENS:
             reached_token_limit = True
             break
 
@@ -156,6 +148,7 @@ def tokenize_texts():
         token_ids = [bos_id, *query_ids, sep_id, *answer_ids, eos_id]
         packing_pool.append((token_ids, query_length, answer_length, total_length))
         document_tokens += total_length
+        documents_by_source[source] += 1
         pbar.update(total_length)
 
         if len(packing_pool) >= PACKING_POOL_SIZE:
@@ -167,23 +160,21 @@ with (
     open(DOCUMENT_LENGTHS_BIN, "wb") as document_lengths_file,
     open(SEQUENCE_DOCUMENT_COUNTS_BIN, "wb") as sequence_counts_file,
 ):
-    for example in dataset:
-        query = example["query"].strip() if example["query"] else ""
-        answer = example["synthetic_answer"].strip() if example["synthetic_answer"] else ""
+    for source in DATASET_NAMES:
+        for query, answer in iter_dataset(source, synth_documents=None):
+            texts.append((source, query, answer))
 
-        if not query or not answer:
-            empty_documents += 1
-            continue
+            if len(texts) >= BATCH_TEXTS:
+                tokenize_texts()
+                if reached_token_limit:
+                    break
+                if source == "synth" and documents_by_source[source] >= SYNTH_DOCUMENTS:
+                    break
 
-        texts.append((query, answer))
-
-        if len(texts) >= BATCH_TEXTS:
+        if not reached_token_limit:
             tokenize_texts()
-            if reached_token_limit:
-                break
-
-    if not reached_token_limit:
-        tokenize_texts()
+        if reached_token_limit:
+            break
 
     write_packing_pool()
 
@@ -191,7 +182,9 @@ pbar.close()
 
 print(f"[*] Wrote {document_tokens:,} document tokens")
 print(f"[*] Packed {documents_written:,} documents into {sequences_written:,} sequences")
-print(f"[*] Skipped {empty_documents:,} empty and {oversized_documents:,} oversized documents")
+for source, count in documents_by_source.items():
+    print(f"[*] {source}: {count:,} documents")
+print(f"[*] Skipped {oversized_documents:,} oversized documents")
 if sequences_written:
     packing_efficiency = document_tokens / (sequences_written * SEQ_LEN)
     print(f"[*] Packing efficiency: {packing_efficiency:.2%}")
