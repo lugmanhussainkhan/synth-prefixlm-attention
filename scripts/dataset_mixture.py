@@ -1,6 +1,8 @@
 from collections import Counter
 
 from datasets import load_dataset
+import pyarrow as pa
+import pyarrow.dataset as ds
 
 
 DATASET_NAMES = (
@@ -16,6 +18,16 @@ FLAN_DOCUMENTS_PER_TYPE = 1_500
 SYNTH_DOCUMENTS = 4_000_000
 SHUFFLE_BUFFER_SIZE = 10_000
 SEED = 42
+
+# The default remote Parquet range is 32 MiB. These datasets are read
+# sequentially from large shards, so one larger prefetched range reduces HTTP
+# request latency without materializing the dataset locally.
+PARQUET_SCAN_OPTIONS = ds.ParquetFragmentScanOptions(
+    cache_options=pa.CacheOptions(
+        prefetch_limit=1,
+        range_size_limit=128 << 20,
+    ),
+)
 
 FLAN_SUBSETS = (
     "dialog_fsopt_data",
@@ -280,7 +292,9 @@ def iter_tasksource(max_per_type=TASKSOURCE_DOCUMENTS_PER_TYPE):
         "tasksource/tasksource-instruct-v0",
         split="train",
         streaming=True,
+        filters=[("task", "in", sorted(TASKSOURCE_TASKS))],
         columns=["inputs", "targets", "task"],
+        fragment_scan_options=PARQUET_SCAN_OPTIONS,
     ).shuffle(seed=SEED, buffer_size=SHUFFLE_BUFFER_SIZE)
 
     for row in dataset:
@@ -303,6 +317,7 @@ def iter_flan(max_per_type=FLAN_DOCUMENTS_PER_TYPE):
             split="train",
             streaming=True,
             columns=["inputs", "targets", "_task_name"],
+            fragment_scan_options=PARQUET_SCAN_OPTIONS,
         ).shuffle(seed=SEED, buffer_size=SHUFFLE_BUFFER_SIZE)
 
         for row in dataset:
@@ -327,6 +342,7 @@ def iter_synth(max_documents=SYNTH_DOCUMENTS):
             ("words", "<", 800),
         ],
         columns=["query", "synthetic_answer"],
+        fragment_scan_options=PARQUET_SCAN_OPTIONS,
     ).shuffle(seed=SEED, buffer_size=SHUFFLE_BUFFER_SIZE)
 
     documents = 0
@@ -345,6 +361,7 @@ def iter_textbook():
         split="train",
         streaming=True,
         columns=["question", "answer", "subject", "reference_answer"],
+        fragment_scan_options=PARQUET_SCAN_OPTIONS,
     ).shuffle(seed=SEED, buffer_size=SHUFFLE_BUFFER_SIZE)
 
     for row in dataset:

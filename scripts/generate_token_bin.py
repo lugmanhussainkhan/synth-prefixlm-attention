@@ -1,5 +1,6 @@
 from collections import Counter
 from pathlib import Path
+from time import monotonic
 
 import numpy as np
 from tokenizers import ByteLevelBPETokenizer
@@ -53,7 +54,13 @@ oversized_documents = 0
 reached_token_limit = False
 documents_by_source = Counter()
 
-pbar = tqdm(total=MAX_TOKENS, desc="[*] Gathering document tokens", unit="tokens")
+progress_start = monotonic()
+pbar = tqdm(
+    total=MAX_TOKENS,
+    desc="[*] Gathering document tokens",
+    unit="tokens",
+    bar_format="{desc}: {n_fmt}{unit} [{elapsed}{postfix}]",
+)
 
 
 def write_packing_pool():
@@ -125,6 +132,7 @@ def tokenize_texts():
     encoded_queries = tokenizer.encode_batch(queries, add_special_tokens=False)
     encoded_answers = tokenizer.encode_batch(answers, add_special_tokens=False)
     texts.clear()
+    batch_tokens = 0
 
     for source, encoded_query, encoded_answer in zip(sources, encoded_queries, encoded_answers):
         if source == "synth" and documents_by_source[source] >= SYNTH_DOCUMENTS:
@@ -148,11 +156,18 @@ def tokenize_texts():
         token_ids = [bos_id, *query_ids, sep_id, *answer_ids, eos_id]
         packing_pool.append((token_ids, query_length, answer_length, total_length))
         document_tokens += total_length
+        batch_tokens += total_length
         documents_by_source[source] += 1
-        pbar.update(total_length)
 
         if len(packing_pool) >= PACKING_POOL_SIZE:
             write_packing_pool()
+
+    pbar.update(batch_tokens)
+    elapsed = max(monotonic() - progress_start, 1e-9)
+    pbar.set_postfix_str(
+        f"{document_tokens / elapsed:,.0f} avg tokens/s",
+        refresh=False,
+    )
 
 
 with (
@@ -161,6 +176,7 @@ with (
     open(SEQUENCE_DOCUMENT_COUNTS_BIN, "wb") as sequence_counts_file,
 ):
     for source in DATASET_NAMES:
+        pbar.set_description_str(f"[*] Gathering {source} tokens")
         for query, answer in iter_dataset(source, synth_documents=None):
             texts.append((source, query, answer))
 
